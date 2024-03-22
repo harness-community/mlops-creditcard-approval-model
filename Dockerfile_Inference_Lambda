@@ -1,0 +1,22 @@
+# Use the AWS provided Python 3.10 base image for Lambda
+FROM public.ecr.aws/lambda/python:3.10
+
+# Define build-time variables
+ARG MLFLOW_TRACKING_URI
+ARG HARNESS_PIPELINE_ID
+
+ENV MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI}
+ENV HARNESS_PIPELINE_ID=${HARNESS_PIPELINE_ID}
+
+# Set the working directory to the Lambda task root (recommended by AWS)
+WORKDIR ${LAMBDA_TASK_ROOT}
+
+# Copy everything to the container image
+COPY . .
+
+# Upgrade pip and install required Python packages from requirements.txt
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt
+
+# Set the CMD to your handler, this can be overridden via the AWS console or CLI if necessary
+CMD ["lambda_function.lambda_handler"]

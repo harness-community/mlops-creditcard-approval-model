@@ -1,0 +1,8 @@
+data:
+  load_file_path: 'synthetic_credit_card_approval.csv'
+model:
+  save_file_path: 'selected_model.joblib'
+  save_metrics_file_path: 'selected_model_metrics.joblib'
+mlflow:
+  experiment_name : 'Example MLOps'
+  run_name : 'Initial Model'
