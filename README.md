@@ -4,4 +4,4 @@ This repository contains a data science project that calculates the accuracy and
 
 ## Command to run the test against a container image previously built
 
-pytest --nbval-lax credit_card_approval.ipynb --junitxml=report.xml
+RUN pytest --nbval-lax credit_card_approval.ipynb --junitxml=report.xml
