@@ -1,0 +1,367 @@
+pipeline:
+  projectIdentifier: default_project
+  orgIdentifier: default
+  tags: {}
+  stages:
+    - stage:
+        name: Train Model
+        identifier: Train_Model
+        description: ""
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: BuildAndPushECR
+                  name: Harness Training
+                  identifier: Harness_Training
+                  spec:
+                    connectorRef: mlopsawsconnector
+                    region: YOUR_AWS_REGION
+                    account: YOUR_AWS_ACCOUNT_ID
+                    imageName: ccapproval
+                    tags:
+                      - <+pipeline.executionId>
+                    dockerfile: Dockerfile_Training_Testing
+                  when:
+                    stageStatus: Success
+              - step:
+                  type: Run
+                  name: Wait for ECR Image Scan
+                  identifier: Wait_for_ECR_Image_Scan
+                  spec:
+                    shell: Sh
+                    command: |-
+                      echo "ECR Image Scan In Progress...
+                      sleep 15
+              - step:
+                  type: AWSECR
+                  name: Security Scans for ML Model
+                  identifier: Security_Scans_for_ML_Model
+                  spec:
+                    mode: extraction
+                    config: default
+                    target:
+                      type: container
+                      name: ccapproval-ecr-scan
+                      variant: <+pipeline.executionId>
+                    advanced:
+                      log:
+                        level: info
+                    settings:
+                      AWS_SESSION_TOKEN: <+secrets.getValue("aws_session_token")>
+                    auth:
+                      access_token: <+secrets.getValue("aws_secret_access_key")>
+                      access_id: <+secrets.getValue("aws_access_key_id")>
+                      region: YOUR_AWS_REGION
+                    image:
+                      type: aws_ecr
+                      name: ccapproval
+                      region: YOUR_AWS_REGION
+                      tag: <+pipeline.executionId>
+          caching:
+            enabled: false
+            paths: []
+        when:
+          pipelineStatus: Success
+    - stage:
+        name: Run test and upload artifacts
+        identifier: Run_test_and_upload_artifacts
+        description: ""
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: pytest
+                  identifier: pytest
+                  spec:
+                    connectorRef: mlopsawsconnector
+                    image: YOUR_AWS_ACCOUNT_ID.dkr.ecr.YOUR_AWS_REGION.amazonaws.com/ccapproval:<+pipeline.executionId>
+                    shell: Sh
+                    command: |
+                      pytest --nbval-lax credit_card_approval.ipynb --junitxml=report.xml
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Ignore
+                  when:
+                    stageStatus: Success
+              - step:
+                  type: BuildAndPushECR
+                  name: Build and Push Lambda Deployment Image
+                  identifier: Build_and_Push_Lambda_Deployment_Image
+                  spec:
+                    connectorRef: mlopsawsconnector
+                    region: YOUR_AWS_REGION
+                    account: YOUR_AWS_ACCOUNT_ID
+                    imageName: ccapproval-deploy
+                    tags:
+                      - <+pipeline.executionId>
+                    dockerfile: Dockerfile_Inference_Lambda
+              - step:
+                  type: S3Upload
+                  name: Upload artifacts to S3
+                  identifier: Upload_artifacts_to_S3
+                  spec:
+                    connectorRef: mlopsawsconnector
+                    region: YOUR_AWS_REGION
+                    bucket: YOUR_S3_BUCKET
+                    sourcePath: /harness/output/model_metrics.html
+              - step:
+                  type: Plugin
+                  name: Publish ML model visualization
+                  identifier: Publish_ML_model_visualization
+                  spec:
+                    connectorRef: account.harnessImage
+                    image: plugins/artifact-metadata-publisher
+                    settings:
+                      file_urls: https://YOUR_S3_BUCKET.s3.YOUR_AWS_REGION.amazonaws.com/harness/output/model_metrics.html
+              - step:
+                  type: Run
+                  name: Export accuracy and fairness variables
+                  identifier: Export_accuracy_and_fairness_variables
+                  spec:
+                    shell: Sh
+                    command: |
+                      # File path
+                      FILE_PATH="/harness/output/shared_env_variables.txt"
+
+                      # Read the file and export variables
+                      while IFS='=' read -r key value; do
+                          case $key in
+                              ACCURACY)
+                                  export ACCURACY="$value"
+                                  ;;
+                              EQUAL_OPPORTUNITY_FAIRNESS_PERCENT)
+                                  export EQUAL_OPPORTUNITY_FAIRNESS_PERCENT="$value"
+                                  ;;
+                              *)
+                                  echo "Ignoring unknown variable: $key"
+                                  ;;
+                          esac
+                      done < "$FILE_PATH"
+
+                      echo $ACCURACY
+                      echo $EQUAL_OPPORTUNITY_FAIRNESS_PERCENT
+                    outputVariables:
+                      - name: ACCURACY
+                      - name: EQUAL_OPPORTUNITY_FAIRNESS_PERCENT
+          pipelineStatus: Success
+          caching:
+            enabled: false
+            paths: []
+          sharedPaths:
+            - /harness/output
+        when:
+          pipelineStatus: Success
+    - stage:
+        name: Model Policy Checks
+        identifier: Model_Policy_Checks
+        description: ""
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: ShellScript
+                  name: Accuracy and Fairness
+                  identifier: Accuracy_and_Fairness
+                  spec:
+                    shell: Bash
+                    executionTarget: {}
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          accuracy=<+pipeline.stages.Run_test_and_upload_artifacts.spec.execution.steps.Export_accuracy_and_fairness_variables.output.outputVariables.ACCURACY>
+                          fairness_equalopportunity=<+pipeline.stages.Run_test_and_upload_artifacts.spec.execution.steps.Export_accuracy_and_fairness_variables.output.outputVariables.EQUAL_OPPORTUNITY_FAIRNESS_PERCENT>
+                    environmentVariables: []
+                    outputVariables:
+                      - name: accuracy
+                        type: String
+                        value: accuracy
+                      - name: fairness_equalopportunity
+                        type: String
+                        value: fairness_equalopportunity
+                  timeout: 10m
+              - step:
+                  type: Policy
+                  name: Enforce Fairness and Accuracy Policy
+                  identifier: Enforce_Fairness_Policy
+                  spec:
+                    policySets:
+                      - Credit_Card_Approval_Policy_Set
+                    type: Custom
+                    policySpec:
+                      payload: |-
+                        {
+                            "accuracy": <+execution.steps.Accuracy_and_Fairness.output.outputVariables.accuracy>,
+                            "fairnessScoreEqualOpportunity": <+execution.steps.Accuracy_and_Fairness.output.outputVariables.fairness_equalopportunity>
+                        }
+                  timeout: 10m
+        tags: {}
+        when:
+          pipelineStatus: Success
+    - stage:
+        name: lambdadeployment
+        identifier: lambdadeployment
+        description: ""
+        type: Deployment
+        spec:
+          deploymentType: AwsLambda
+          service:
+            serviceRef: creditcardapproval-lambda-service
+            serviceInputs:
+              serviceDefinition:
+                type: AwsLambda
+                spec:
+                  artifacts:
+                    primary:
+                      primaryArtifactRef: <+input>
+                      sources: <+input>
+          environment:
+            environmentRef: lambda-env
+            deployToAll: false
+            infrastructureDefinitions:
+              - identifier: aws-lambda-infra
+          execution:
+            steps:
+              - step:
+                  name: Deploy Aws Lambda
+                  identifier: deployawslambda
+                  type: AwsLambdaDeploy
+                  timeout: 10m
+                  spec: {}
+            rollbackSteps:
+              - step:
+                  name: Aws Lambda rollback
+                  identifier: awslambdarollback
+                  type: AwsLambdaRollback
+                  timeout: 10m
+                  spec: {}
+        tags: {}
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
+    - stage:
+        name: Monitor Model Stage
+        identifier: Monitor_Model_Stage
+        description: ""
+        type: CI
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Monitor Model Step
+                  identifier: Monitor_Model_Step
+                  spec:
+                    shell: Sh
+                    command: |-
+                      # GitHub repository owner
+                      OWNER="YOUR_GITHUB_USERNAME"
+
+                      # GitHub repository name
+                      REPO="mlops-creditcard-approval-model"
+
+                      # Path to the file you want to check (relative to the repository root)
+                      FILE_PATH="credit_card_approval.ipynb"
+
+                      # GitHub Personal Access Token (PAT)
+                      TOKEN=<+secrets.getValue("git_pat")>
+
+                      # GitHub API URL
+                      API_URL="https://api.github.com/repos/$OWNER/$REPO/commits?path=$FILE_PATH&per_page=1"
+
+                      # Get the current date
+                      CURRENT_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+                      # Calculate the date 7 days ago
+                      SEVEN_DAYS_AGO=$(date -u -d "7 days ago" +"%Y-%m-%dT%H:%M:%SZ")
+
+                      # Get the latest commit date for the file
+                      LATEST_COMMIT_DATE=$(curl -s -H "Authorization: token $TOKEN" $API_URL | jq -r '.[0].commit.committer.date')
+                      echo $LATEST_COMMIT_DATE
+
+                      # Check if the file has been updated in the last 7 days
+                      if [ "$(date -d "$LATEST_COMMIT_DATE" +%s)" -lt "$(date -d "$SEVEN_DAYS_AGO" +%s)" ]; then
+                          export model_stale=true
+                          echo "the model has not been updated in 7 days"
+                      else
+                          export model_stale=false
+                          echo "the model has been recently updated"
+                      fi
+                    outputVariables:
+                      - name: model_stale
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          cloneCodebase: false
+        tags: {}
+        when:
+          pipelineStatus: Success
+          caching:
+            enabled: false
+            paths: []
+    - stage:
+        name: Notify
+        identifier: notify
+        description: ""
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: Email
+                  name: Email
+                  identifier: Email
+                  spec:
+                    to: YOUR_EMAIL
+                    cc: ""
+                    subject: Credit card approval ML model has not been updated in a week.
+                    body: |-
+                      ***** Reminder *****
+
+                      It has been 7 day(s) since the credit card approval ML model was updated. Please update the model.
+                  timeout: 10m
+                  when:
+                    stageStatus: Success
+                    condition: <+pipeline.stages.Monitor_Model_Stage.spec.execution.steps.Monitor_Model_Step.output.outputVariables.model_stale> == true
+        tags: {}
+        when:
+          pipelineStatus: Success
+  properties:
+    ci:
+      codebase:
+        connectorRef: mlopsgithubconnector
+        build: <+input>
+  notificationRules: []
+  allowStageExecutions: true
+  identifier: MLOps_creditcard_approval_pipeline
+  name: MLOps creditcard approval pipeline
+  delegateSelectors:
+    - docker-delegate
